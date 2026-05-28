@@ -59,6 +59,15 @@ _MAX_DOMAIN_FILTERS = 5  # xAI hard cap on allowed_domains / excluded_domains
 _JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}", re.MULTILINE)
 
 
+def _model_name_for_xai_web_search(raw_model: str) -> str:
+    model = str(raw_model or "").strip()
+    if model.startswith("@"):
+        parts = model.split(":")
+        if parts:
+            model = parts[-1].strip()
+    return model
+
+
 @dataclass(frozen=True)
 class XAIWebEndpoint:
     name: str
@@ -122,7 +131,7 @@ def _load_configured_endpoints(cfg: Dict[str, Any]) -> List[XAIWebEndpoint]:
         return []
 
     raw_default_model = cfg.get("model") if isinstance(cfg.get("model"), str) else DEFAULT_MODEL
-    default_model = str(raw_default_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    default_model = _model_name_for_xai_web_search(raw_default_model or DEFAULT_MODEL) or DEFAULT_MODEL
     default_timeout = _coerce_timeout(cfg.get("timeout", DEFAULT_TIMEOUT))
     endpoints: List[XAIWebEndpoint] = []
 
@@ -138,7 +147,7 @@ def _load_configured_endpoints(cfg: Dict[str, Any]) -> List[XAIWebEndpoint]:
         if not api_key and api_key_env:
             api_key = str(get_env_value(api_key_env) or "").strip()
         raw_model = raw.get("model") if isinstance(raw.get("model"), str) else default_model
-        model = str(raw_model or default_model).strip() or default_model
+        model = _model_name_for_xai_web_search(raw_model or default_model) or default_model
         timeout = _coerce_timeout(raw.get("timeout", default_timeout), default_timeout)
         if not base_url or not api_key:
             logger.warning("Skipping xAI web endpoint %s: missing base_url or api_key", name)
@@ -175,6 +184,10 @@ def _has_configured_xai_endpoint(cfg: Optional[Dict[str, Any]] = None) -> bool:
         if not api_key and api_key_env:
             api_key = str(get_env_value(api_key_env) or "").strip()
         if base_url and api_key:
+            return True
+    fallback = cfg.get("fallback")
+    if isinstance(fallback, dict) and fallback.get("enabled") is True:
+        if str(fallback.get("type") or "").strip().lower() == "current_model":
             return True
     return False
 
@@ -219,7 +232,7 @@ def _fallback_current_model_endpoint(cfg: Dict[str, Any]) -> tuple[Optional[XAIW
             "endpoint": "current_model",
             "error": "current model does not advertise native Responses API web_search support",
         }
-    model = str(runtime.get("model") or runtime.get("default") or "").strip() if isinstance(runtime, dict) else ""
+    model = _model_name_for_xai_web_search(runtime.get("model") or runtime.get("default") or "") if isinstance(runtime, dict) else ""
     if not model:
         try:
             from hermes_cli.config import load_config
@@ -227,9 +240,9 @@ def _fallback_current_model_endpoint(cfg: Dict[str, Any]) -> tuple[Optional[XAIW
             full_cfg = load_config()
             model_cfg = full_cfg.get("model") if isinstance(full_cfg, dict) else None
             if isinstance(model_cfg, dict):
-                model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+                model = _model_name_for_xai_web_search(model_cfg.get("default") or model_cfg.get("model") or "")
             elif isinstance(model_cfg, str):
-                model = model_cfg.strip()
+                model = _model_name_for_xai_web_search(model_cfg)
         except Exception:
             model = ""
     timeout = _coerce_timeout(fallback.get("timeout", cfg.get("timeout", DEFAULT_TIMEOUT)))
@@ -254,7 +267,7 @@ def _legacy_endpoint_from_credentials(creds: Dict[str, Any], cfg: Dict[str, Any]
         return None
     base_url = str(creds.get("base_url") or "https://api.x.ai/v1").strip().rstrip("/")
     raw_model = cfg.get("model") if isinstance(cfg.get("model"), str) else DEFAULT_MODEL
-    model = str(raw_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    model = _model_name_for_xai_web_search(raw_model or DEFAULT_MODEL) or DEFAULT_MODEL
     return XAIWebEndpoint(
         name="default",
         base_url=base_url,
