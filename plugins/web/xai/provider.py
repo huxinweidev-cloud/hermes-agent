@@ -34,11 +34,14 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from agent.web_search_provider import WebSearchProvider
 from tools.xai_http import (
+    get_env_value,
     has_xai_credentials,
     hermes_xai_user_agent,
     resolve_xai_http_credentials,
@@ -54,6 +57,16 @@ _MAX_DOMAIN_FILTERS = 5  # xAI hard cap on allowed_domains / excluded_domains
 # prose since reasoning models occasionally narrate before the JSON block
 # even when explicitly asked not to.
 _JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class XAIWebEndpoint:
+    name: str
+    base_url: str
+    api_key: str
+    model: str
+    timeout: float
+    provider: str = "xai"
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +99,170 @@ def _coerce_domain_list(value: Any) -> List[str]:
         if len(cleaned) >= _MAX_DOMAIN_FILTERS:
             break
     return cleaned
+
+
+def _coerce_timeout(value: Any, default: float = DEFAULT_TIMEOUT) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _redact_error_text(value: Any, *, limit: int = 300) -> str:
+    text = str(value or "")[:limit]
+    for marker in ("Authorization", "Bearer ", "api_key", "token", "secret"):
+        if marker.lower() in text.lower():
+            return "[REDACTED]"
+    return text
+
+
+def _load_configured_endpoints(cfg: Dict[str, Any]) -> List[XAIWebEndpoint]:
+    raw_endpoints = cfg.get("endpoints")
+    if not isinstance(raw_endpoints, list):
+        return []
+
+    raw_default_model = cfg.get("model") if isinstance(cfg.get("model"), str) else DEFAULT_MODEL
+    default_model = str(raw_default_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    default_timeout = _coerce_timeout(cfg.get("timeout", DEFAULT_TIMEOUT))
+    endpoints: List[XAIWebEndpoint] = []
+
+    for index, raw in enumerate(raw_endpoints):
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("enabled", True) is False:
+            continue
+        name = str(raw.get("name") or f"endpoint_{index + 1}").strip() or f"endpoint_{index + 1}"
+        base_url = str(raw.get("base_url") or "").strip().rstrip("/")
+        api_key = str(raw.get("api_key") or "").strip()
+        api_key_env = str(raw.get("api_key_env") or "").strip()
+        if not api_key and api_key_env:
+            api_key = str(get_env_value(api_key_env) or "").strip()
+        raw_model = raw.get("model") if isinstance(raw.get("model"), str) else default_model
+        model = str(raw_model or default_model).strip() or default_model
+        timeout = _coerce_timeout(raw.get("timeout", default_timeout), default_timeout)
+        if not base_url or not api_key:
+            logger.warning("Skipping xAI web endpoint %s: missing base_url or api_key", name)
+            continue
+        endpoints.append(XAIWebEndpoint(
+            name=name,
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            timeout=timeout,
+        ))
+    return endpoints
+
+
+def _has_configured_xai_endpoint(cfg: Optional[Dict[str, Any]] = None) -> bool:
+    """Cheaply check whether web.xai.endpoints contains a usable endpoint.
+
+    This intentionally avoids OAuth/runtime-provider resolution. It only reads
+    config + env/.env values, so backend availability checks can call it during
+    tool registration without triggering network refreshes.
+    """
+    cfg = cfg if isinstance(cfg, dict) else _load_xai_web_config()
+    raw_endpoints = cfg.get("endpoints")
+    if not isinstance(raw_endpoints, list):
+        return False
+    for raw in raw_endpoints:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("enabled", True) is False:
+            continue
+        base_url = str(raw.get("base_url") or "").strip()
+        api_key = str(raw.get("api_key") or "").strip()
+        api_key_env = str(raw.get("api_key_env") or "").strip()
+        if not api_key and api_key_env:
+            api_key = str(get_env_value(api_key_env) or "").strip()
+        if base_url and api_key:
+            return True
+    return False
+
+
+def _ordered_endpoints(endpoints: List[XAIWebEndpoint], strategy: Any) -> List[XAIWebEndpoint]:
+    if not endpoints:
+        return []
+    strategy_name = str(strategy or "failover").strip().lower()
+    if strategy_name == "random_start_failover" and len(endpoints) > 1:
+        start = random.randrange(len(endpoints))
+        return endpoints[start:] + endpoints[:start]
+    return list(endpoints)
+
+
+def _fallback_current_model_endpoint(cfg: Dict[str, Any]) -> tuple[Optional[XAIWebEndpoint], Optional[Dict[str, Any]]]:
+    fallback = cfg.get("fallback")
+    if not isinstance(fallback, dict) or fallback.get("enabled") is not True:
+        return None, None
+    if str(fallback.get("type") or "").strip().lower() != "current_model":
+        return None, None
+    if fallback.get("require_native_web_search") is not True:
+        return None, {
+            "endpoint": "current_model",
+            "error": "current_model fallback requires require_native_web_search: true",
+        }
+
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider()
+    except Exception as exc:  # noqa: BLE001
+        return None, {
+            "endpoint": "current_model",
+            "error": f"Could not resolve current model runtime: {_redact_error_text(exc)}",
+        }
+
+    api_key = str(runtime.get("api_key") or "").strip() if isinstance(runtime, dict) else ""
+    base_url = str(runtime.get("base_url") or "").strip().rstrip("/") if isinstance(runtime, dict) else ""
+    api_mode = str(runtime.get("api_mode") or "").strip().lower() if isinstance(runtime, dict) else ""
+    if api_mode != "codex_responses":
+        return None, {
+            "endpoint": "current_model",
+            "error": "current model does not advertise native Responses API web_search support",
+        }
+    model = str(runtime.get("model") or runtime.get("default") or "").strip() if isinstance(runtime, dict) else ""
+    if not model:
+        try:
+            from hermes_cli.config import load_config
+
+            full_cfg = load_config()
+            model_cfg = full_cfg.get("model") if isinstance(full_cfg, dict) else None
+            if isinstance(model_cfg, dict):
+                model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+            elif isinstance(model_cfg, str):
+                model = model_cfg.strip()
+        except Exception:
+            model = ""
+    timeout = _coerce_timeout(fallback.get("timeout", cfg.get("timeout", DEFAULT_TIMEOUT)))
+    if not api_key or not base_url or not model:
+        return None, {
+            "endpoint": "current_model",
+            "error": "current model does not expose native Responses API web_search credentials/model",
+        }
+    return XAIWebEndpoint(
+        name="current_model",
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        timeout=timeout,
+        provider=str(runtime.get("provider") or "current_model"),
+    ), None
+
+
+def _legacy_endpoint_from_credentials(creds: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[XAIWebEndpoint]:
+    api_key = str(creds.get("api_key") or "").strip()
+    if not api_key:
+        return None
+    base_url = str(creds.get("base_url") or "https://api.x.ai/v1").strip().rstrip("/")
+    raw_model = cfg.get("model") if isinstance(cfg.get("model"), str) else DEFAULT_MODEL
+    model = str(raw_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    return XAIWebEndpoint(
+        name="default",
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        timeout=_coerce_timeout(cfg.get("timeout", DEFAULT_TIMEOUT)),
+        provider=str(creds.get("provider") or "xai"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -126,16 +303,14 @@ class XAIWebSearchProvider(WebSearchProvider):
         return "xAI Web Search (Grok)"
 
     def is_available(self) -> bool:
-        """Cheap availability probe — env var OR auth-store has OAuth tokens.
+        """Cheap availability probe — configured endpoint OR env/auth credentials.
 
-        Delegates to :func:`tools.xai_http.has_xai_credentials`, which is
-        deliberately *not* the same as :func:`resolve_xai_http_credentials`:
-        it never triggers OAuth token refresh or acquires the auth-store
-        lock. The ABC contract requires this method to be safe to call on
-        every ``hermes tools`` repaint and at tool-registration time.
-        Token freshness / refresh is handled inside :meth:`search`.
+        This deliberately avoids :func:`resolve_xai_http_credentials`: provider
+        availability is checked during registry resolution and tool UI refreshes,
+        so it must not trigger OAuth refreshes or network calls. Token freshness
+        / refresh is handled inside :meth:`search`.
         """
-        return has_xai_credentials()
+        return _has_configured_xai_endpoint() or has_xai_credentials()
 
     def supports_search(self) -> bool:
         return True
@@ -162,18 +337,6 @@ class XAIWebSearchProvider(WebSearchProvider):
         except Exception:  # noqa: BLE001 — interrupt module is best-effort
             pass
 
-        creds = resolve_xai_http_credentials()
-        api_key = str(creds.get("api_key") or "").strip()
-        base_url = str(creds.get("base_url") or "https://api.x.ai/v1").strip().rstrip("/")
-        if not api_key:
-            return {
-                "success": False,
-                "error": (
-                    "No xAI credentials found. Run `hermes auth` to sign in with "
-                    "xAI Grok OAuth, or set XAI_API_KEY."
-                ),
-            }
-
         # Clamp limit to the same range the caller (web_search_tool) accepts,
         # so we don't silently downgrade explicit limits. Grok happily
         # produces longer lists; cost scales linearly with the requested
@@ -185,14 +348,6 @@ class XAIWebSearchProvider(WebSearchProvider):
         limit = max(1, min(limit, 100))
 
         cfg = _load_xai_web_config()
-        model = cfg.get("model") if isinstance(cfg.get("model"), str) else DEFAULT_MODEL
-        model = model.strip() or DEFAULT_MODEL
-
-        try:
-            timeout = float(cfg.get("timeout", DEFAULT_TIMEOUT))
-        except (TypeError, ValueError):
-            timeout = DEFAULT_TIMEOUT
-
         allowed = _coerce_domain_list(cfg.get("allowed_domains"))
         excluded = _coerce_domain_list(cfg.get("excluded_domains"))
         if allowed and excluded:
@@ -214,17 +369,69 @@ class XAIWebSearchProvider(WebSearchProvider):
 
         prompt = self._build_prompt(query, limit)
 
+        configured_endpoints = _load_configured_endpoints(cfg)
+        if configured_endpoints:
+            endpoints = _ordered_endpoints(configured_endpoints, cfg.get("strategy"))
+        else:
+            creds = resolve_xai_http_credentials()
+            legacy_endpoint = _legacy_endpoint_from_credentials(creds, cfg)
+            if not legacy_endpoint:
+                return {
+                    "success": False,
+                    "error": (
+                        "No xAI credentials found. Run `hermes auth` to sign in with "
+                        "xAI Grok OAuth, or set XAI_API_KEY."
+                    ),
+                }
+            endpoints = [legacy_endpoint]
+
+        details: List[Dict[str, Any]] = []
+        for endpoint in endpoints:
+            result = self._search_endpoint(endpoint, prompt, limit, web_search_tool)
+            if result.get("success") is True:
+                return result
+            details.append(result.get("detail") or {
+                "endpoint": endpoint.name,
+                "error": result.get("error", "unknown error"),
+            })
+
+        fallback_endpoint, fallback_error = _fallback_current_model_endpoint(cfg)
+        if fallback_endpoint is not None:
+            result = self._search_endpoint(fallback_endpoint, prompt, limit, web_search_tool)
+            if result.get("success") is True:
+                return result
+            details.append(result.get("detail") or {
+                "endpoint": "current_model",
+                "error": result.get("error", "unknown error"),
+            })
+        elif fallback_error is not None:
+            details.append(fallback_error)
+
+        if configured_endpoints:
+            error = "All xAI web search endpoints failed"
+            if any(d.get("endpoint") == "current_model" for d in details):
+                error += ", and current model fallback failed or is unavailable"
+            return {"success": False, "error": error, "details": details}
+
+        first_error = details[0].get("error") if details else "xAI web search failed"
+        return {"success": False, "error": str(first_error)}
+
+    def _search_endpoint(
+        self,
+        endpoint: XAIWebEndpoint,
+        prompt: str,
+        limit: int,
+        web_search_tool: Dict[str, Any],
+    ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
-            "model": model,
+            "model": endpoint.model,
             "input": [{"role": "user", "content": prompt}],
             "tools": [web_search_tool],
-            # Drop inline citation markdown — we want the JSON block clean,
-            # and we read URLs from annotations / citations separately.
             "include": ["no_inline_citations"],
         }
 
         headers = {
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {endpoint.api_key}",
             "Content-Type": "application/json",
             "User-Agent": hermes_xai_user_agent(),
         }
@@ -235,39 +442,31 @@ class XAIWebSearchProvider(WebSearchProvider):
             return {
                 "success": False,
                 "error": "httpx is not installed (required for xAI web search)",
+                "detail": {"endpoint": endpoint.name, "error": "httpx is not installed"},
             }
 
         logger.info(
-            "xAI web search via %s: '%s' (limit=%d, model=%s)",
-            base_url, query, limit, model,
+            "xAI web search via %s: (limit=%d, model=%s, endpoint=%s)",
+            endpoint.base_url, limit, endpoint.model, endpoint.name,
         )
 
-        # Two-attempt loop: if the first call returns 401 and our creds came
-        # from the OAuth path, force-refresh the token once and retry. This
-        # closes two gaps the proactive resolver check doesn't cover:
-        # (1) opaque (non-JWT) access tokens — `_xai_access_token_is_expiring`
-        #     can't decode them and returns False, so refresh never fires
-        #     until the server hands us a 401.
-        # (2) mid-window revocation — admin revoke, refresh-token rotation,
-        #     or clock skew can produce 401s on a token whose JWT `exp` claim
-        #     is still in the future.
-        # Env-var (`XAI_API_KEY`) credentials skip the retry entirely — we
-        # can't refresh those and an immediate retry would just burn quota.
-        is_oauth_path = (creds.get("provider") == "xai-oauth")
         resp = None
-        for attempt in range(2):
+        max_attempts = 2 if endpoint.provider == "xai-oauth" else 1
+        current_endpoint = endpoint
+        for attempt in range(max_attempts):
+            headers["Authorization"] = f"Bearer {current_endpoint.api_key}"
             try:
                 resp = httpx.post(
-                    f"{base_url}/responses",
+                    f"{current_endpoint.base_url}/responses",
                     headers=headers,
                     json=payload,
-                    timeout=timeout,
+                    timeout=current_endpoint.timeout,
                 )
                 resp.raise_for_status()
                 break
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code if exc.response is not None else 0
-                if status == 401 and attempt == 0 and is_oauth_path:
+                if status == 401 and attempt == 0 and current_endpoint.provider == "xai-oauth":
                     logger.info(
                         "xAI web search got 401 on first attempt; forcing OAuth "
                         "refresh and retrying once.",
@@ -275,49 +474,63 @@ class XAIWebSearchProvider(WebSearchProvider):
                     try:
                         refreshed = resolve_xai_http_credentials(force_refresh=True)
                         refreshed_key = str(refreshed.get("api_key") or "").strip()
-                        if refreshed_key and refreshed_key != api_key:
-                            api_key = refreshed_key
-                            headers["Authorization"] = f"Bearer {api_key}"
+                        if refreshed_key and refreshed_key != current_endpoint.api_key:
+                            refreshed_base_url = str(
+                                refreshed.get("base_url") or current_endpoint.base_url
+                            ).strip().rstrip("/")
+                            current_endpoint = XAIWebEndpoint(
+                                name=current_endpoint.name,
+                                base_url=refreshed_base_url or current_endpoint.base_url,
+                                api_key=refreshed_key,
+                                model=current_endpoint.model,
+                                timeout=current_endpoint.timeout,
+                                provider=str(refreshed.get("provider") or current_endpoint.provider),
+                            )
                             continue
-                        # Refresh returned the same (or empty) token — no point
-                        # in retrying. Fall through to the error return below.
                     except Exception as refresh_exc:  # noqa: BLE001
                         logger.warning(
                             "xAI web search OAuth refresh after 401 failed: %s",
-                            refresh_exc,
+                            _redact_error_text(refresh_exc),
                         )
                 body = ""
                 try:
-                    body = exc.response.text[:300] if exc.response is not None else ""
+                    body = _redact_error_text(exc.response.text if exc.response is not None else "")
                 except Exception:
                     body = ""
-                logger.warning("xAI web search HTTP %d: %s", status, body)
+                logger.warning("xAI web search endpoint %s HTTP %d: %s", current_endpoint.name, status, body)
+                error = f"xAI web search returned HTTP {status}: {body}".rstrip()
                 return {
                     "success": False,
-                    "error": f"xAI web search returned HTTP {status}: {body}".rstrip(),
+                    "error": error,
+                    "detail": {"endpoint": current_endpoint.name, "status": status, "error": error},
                 }
             except httpx.RequestError as exc:
-                logger.warning("xAI web search request error: %s", exc)
-                return {"success": False, "error": f"Could not reach xAI: {exc}"}
+                message = _redact_error_text(exc)
+                logger.warning("xAI web search endpoint %s request error: %s", current_endpoint.name, message)
+                return {
+                    "success": False,
+                    "error": f"Could not reach xAI: {message}",
+                    "detail": {"endpoint": current_endpoint.name, "error": message},
+                }
 
         if resp is None:
-            # Defensive — both attempts somehow exited the loop without resp.
-            return {"success": False, "error": "xAI web search produced no response"}
+            return {
+                "success": False,
+                "error": "xAI web search produced no response",
+                "detail": {"endpoint": endpoint.name, "error": "no response"},
+            }
 
         try:
             data = resp.json()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("xAI web search bad JSON: %s", exc)
+            message = _redact_error_text(exc)
+            logger.warning("xAI web search endpoint %s bad JSON: %s", endpoint.name, message)
             return {
                 "success": False,
                 "error": "Could not parse xAI Responses API reply as JSON",
+                "detail": {"endpoint": endpoint.name, "error": "bad JSON"},
             }
 
-        # xAI's Responses surface sometimes returns HTTP 200 with an error
-        # envelope (model overloaded, content-policy refusal, etc.). Without
-        # this check, ``_extract_results`` would silently produce an empty
-        # list and we'd report success-with-no-rows — masking a real failure
-        # the agent should see and decide whether to retry.
         api_error = data.get("error") if isinstance(data, dict) else None
         if isinstance(api_error, dict):
             err_msg = (
@@ -325,14 +538,16 @@ class XAIWebSearchProvider(WebSearchProvider):
                 or api_error.get("code")
                 or "unknown error"
             )
-            logger.warning("xAI web search returned error envelope: %s", err_msg)
-            return {"success": False, "error": f"xAI returned an error: {err_msg}"}
+            err_msg = _redact_error_text(err_msg)
+            logger.warning("xAI web search endpoint %s returned error envelope: %s", endpoint.name, err_msg)
+            return {
+                "success": False,
+                "error": f"xAI returned an error: {err_msg}",
+                "detail": {"endpoint": endpoint.name, "error": err_msg},
+            }
 
         web_results = self._extract_results(data, limit=limit)
         if not web_results:
-            # Successful call, just no usable rows — return success with an
-            # empty list so the model can decide whether to retry. Matches
-            # what brave-free / exa do when the upstream API returns 0 hits.
             return {"success": True, "data": {"web": []}}
 
         return {"success": True, "data": {"web": web_results}}

@@ -219,13 +219,15 @@ def _is_backend_available(backend: str) -> bool:
     if backend == "ddgs":
         return _ddgs_package_importable()
     if backend == "xai":
-        # Cheap probe — env var OR auth.json has OAuth tokens. Must not
-        # call resolve_xai_http_credentials() here because the OAuth path
-        # can trigger a network token refresh, and _is_backend_available
-        # runs on every web_search dispatch + every `hermes tools` repaint.
+        # Cheap probe — configured endpoints/env var OR auth.json has OAuth tokens.
+        # Must not call resolve_xai_http_credentials() here because the OAuth path
+        # can trigger a network token refresh, and _is_backend_available runs on
+        # every web_search dispatch + every `hermes tools` repaint.
         try:
+            from plugins.web.xai.provider import _has_configured_xai_endpoint
             from tools.xai_http import has_xai_credentials
-            return has_xai_credentials()
+
+            return _has_configured_xai_endpoint() or has_xai_credentials()
         except Exception:
             return False
     return False

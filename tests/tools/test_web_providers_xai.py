@@ -658,8 +658,263 @@ class TestXAIProviderSearchErrors:
 
 
 # ---------------------------------------------------------------------------
-# Integration with tools/web_tools.py backend wiring
+# Multi-endpoint failover + current-model fallback
 # ---------------------------------------------------------------------------
+
+
+class TestXAIProviderEndpointFailover:
+    def test_configured_endpoints_use_env_keys_and_fail_over_on_retryable_http(self):
+        import httpx
+        from plugins.web.xai import provider as xai_provider
+
+        cfg = {
+            "model": "grok-4.20-multi-agent-xhigh",
+            "strategy": "failover",
+            "endpoints": [
+                {
+                    "name": "jiuuij",
+                    "base_url": "https://jiuuij.example/v1",
+                    "api_key_env": "XAI_JIUUij_API_KEY",
+                },
+                {
+                    "name": "sin",
+                    "base_url": "https://sin.example/v1",
+                    "api_key_env": "XAI_SIN_API_KEY",
+                },
+            ],
+        }
+        calls: list[dict] = []
+
+        def fake_get_env(name, default=None):
+            values = {
+                "XAI_JIUUij_API_KEY": "primary-secret",
+                "XAI_SIN_API_KEY": "secondary-secret",
+            }
+            return values.get(name, default)
+
+        def fake_post(url, **kwargs):
+            calls.append({
+                "url": url,
+                "auth": kwargs.get("headers", {}).get("Authorization"),
+                "json": kwargs.get("json", {}),
+            })
+            if "jiuuij" in url:
+                bad = MagicMock()
+                bad.status_code = 429
+                bad.text = "rate limited"
+                raise httpx.HTTPStatusError("429", request=MagicMock(), response=bad)
+            return _mock_resp(_responses_payload(json.dumps({
+                "results": [{"title": "ok", "url": "https://ok.example", "description": "from fallback"}]
+            })))
+
+        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds("")), \
+             patch.object(xai_provider, "_load_xai_web_config", return_value=cfg), \
+             patch.object(xai_provider, "get_env_value", side_effect=fake_get_env, create=True), \
+             patch("httpx.post", side_effect=fake_post):
+            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is True
+        assert [c["url"] for c in calls] == [
+            "https://jiuuij.example/v1/responses",
+            "https://sin.example/v1/responses",
+        ]
+        assert [c["auth"] for c in calls] == [
+            "Bearer primary-secret",
+            "Bearer secondary-secret",
+        ]
+        assert calls[0]["json"]["model"] == "grok-4.20-multi-agent-xhigh"
+        assert result["data"]["web"][0]["url"] == "https://ok.example"
+
+    def test_disabled_endpoints_are_skipped(self):
+        from plugins.web.xai import provider as xai_provider
+
+        cfg = {
+            "strategy": "failover",
+            "endpoints": [
+                {
+                    "name": "off",
+                    "enabled": False,
+                    "base_url": "https://disabled.example/v1",
+                    "api_key": "disabled-secret",
+                },
+                {
+                    "name": "on",
+                    "base_url": "https://enabled.example/v1",
+                    "api_key": "enabled-secret",
+                },
+            ],
+        }
+        urls: list[str] = []
+
+        def fake_post(url, **kwargs):
+            urls.append(url)
+            return _mock_resp(_responses_payload(json.dumps({"results": []})))
+
+        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds("")), \
+             patch.object(xai_provider, "_load_xai_web_config", return_value=cfg), \
+             patch("httpx.post", side_effect=fake_post):
+            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is True
+        assert urls == ["https://enabled.example/v1/responses"]
+
+    def test_all_endpoints_failed_returns_redacted_details_without_secret_leakage(self):
+        import httpx
+        from plugins.web.xai import provider as xai_provider
+
+        cfg = {
+            "strategy": "failover",
+            "endpoints": [
+                {"name": "one", "base_url": "https://one.example/v1", "api_key": "primary-secret"},
+                {"name": "two", "base_url": "https://two.example/v1", "api_key": "secondary-secret"},
+            ],
+        }
+
+        def fake_post(url, **kwargs):
+            bad = MagicMock()
+            bad.status_code = 503
+            bad.text = "upstream unavailable"
+            raise httpx.HTTPStatusError("503", request=MagicMock(), response=bad)
+
+        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds("")), \
+             patch.object(xai_provider, "_load_xai_web_config", return_value=cfg), \
+             patch("httpx.post", side_effect=fake_post):
+            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is False
+        assert "All xAI web search endpoints failed" in result["error"]
+        assert [d["endpoint"] for d in result["details"]] == ["one", "two"]
+        serialized = json.dumps(result)
+        assert "primary-secret" not in serialized
+        assert "secondary-secret" not in serialized
+        assert "Authorization" not in serialized
+
+    def test_current_model_fallback_uses_native_responses_web_search_after_primary_failures(self):
+        import httpx
+        from plugins.web.xai import provider as xai_provider
+
+        cfg = {
+            "strategy": "failover",
+            "endpoints": [
+                {"name": "one", "base_url": "https://one.example/v1", "api_key": "primary-secret"},
+            ],
+            "fallback": {
+                "enabled": True,
+                "type": "current_model",
+                "require_native_web_search": True,
+                "timeout": 12,
+            },
+        }
+        calls: list[dict] = []
+
+        def fake_post(url, **kwargs):
+            calls.append({"url": url, "json": kwargs.get("json", {}), "timeout": kwargs.get("timeout")})
+            if "one.example" in url:
+                bad = MagicMock()
+                bad.status_code = 503
+                bad.text = "upstream unavailable"
+                raise httpx.HTTPStatusError("503", request=MagicMock(), response=bad)
+            return _mock_resp(_responses_payload(json.dumps({
+                "results": [{"title": "current", "url": "https://current.example", "description": "native"}]
+            })))
+
+        runtime = {
+            "provider": "custom-openai-compatible",
+            "api_mode": "codex_responses",
+            "model": "grok-4.20-multi-agent-xhigh",
+            "base_url": "https://current-model.example/v1",
+            "api_key": "current-secret",
+        }
+
+        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds("")), \
+             patch.object(xai_provider, "_load_xai_web_config", return_value=cfg), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=runtime), \
+             patch("httpx.post", side_effect=fake_post):
+            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is True
+        assert [c["url"] for c in calls] == [
+            "https://one.example/v1/responses",
+            "https://current-model.example/v1/responses",
+        ]
+        assert calls[1]["json"]["model"] == "grok-4.20-multi-agent-xhigh"
+        assert calls[1]["json"]["tools"] == [{"type": "web_search"}]
+        assert calls[1]["timeout"] == 12
+        assert result["data"]["web"][0]["url"] == "https://current.example"
+
+    def test_current_model_fallback_without_native_credentials_reports_unavailable(self):
+        import httpx
+        from plugins.web.xai import provider as xai_provider
+
+        cfg = {
+            "strategy": "failover",
+            "endpoints": [
+                {"name": "one", "base_url": "https://one.example/v1", "api_key": "primary-secret"},
+            ],
+            "fallback": {
+                "enabled": True,
+                "type": "current_model",
+                "require_native_web_search": True,
+            },
+        }
+
+        def fake_post(url, **kwargs):
+            bad = MagicMock()
+            bad.status_code = 503
+            bad.text = "upstream unavailable"
+            raise httpx.HTTPStatusError("503", request=MagicMock(), response=bad)
+
+        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds("")), \
+             patch.object(xai_provider, "_load_xai_web_config", return_value=cfg), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={"model": "local-only"}), \
+             patch("httpx.post", side_effect=fake_post):
+            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is False
+        assert "current model" in result["error"]
+        assert result["details"][-1]["endpoint"] == "current_model"
+        assert "native Responses API web_search" in result["details"][-1]["error"]
+
+    def test_current_model_fallback_requires_responses_api_mode(self):
+        import httpx
+        from plugins.web.xai import provider as xai_provider
+
+        cfg = {
+            "strategy": "failover",
+            "endpoints": [
+                {"name": "one", "base_url": "https://one.example/v1", "api_key": "primary-secret"},
+            ],
+            "fallback": {
+                "enabled": True,
+                "type": "current_model",
+                "require_native_web_search": True,
+            },
+        }
+
+        def fake_post(url, **kwargs):
+            bad = MagicMock()
+            bad.status_code = 503
+            bad.text = "upstream unavailable"
+            raise httpx.HTTPStatusError("503", request=MagicMock(), response=bad)
+
+        runtime = {
+            "provider": "custom-openai-compatible",
+            "api_mode": "chat_completions",
+            "model": "some-chat-only-model",
+            "base_url": "https://chat-only.example/v1",
+            "api_key": "current-secret",
+        }
+
+        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds("")), \
+             patch.object(xai_provider, "_load_xai_web_config", return_value=cfg), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=runtime), \
+             patch("httpx.post", side_effect=fake_post):
+            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is False
+        assert result["details"][-1]["endpoint"] == "current_model"
+        assert "native Responses API web_search" in result["details"][-1]["error"]
+
 
 
 class TestXAIBackendWiring:
@@ -668,6 +923,24 @@ class TestXAIBackendWiring:
 
         monkeypatch.setenv("XAI_API_KEY", "sk-xai-test")
         assert web_tools._is_backend_available("xai") is True
+
+    def test_is_backend_available_true_via_configured_xai_endpoint(self, monkeypatch):
+        from plugins.web.xai import provider as xai_provider
+        from tools import web_tools
+
+        cfg = {
+            "endpoints": [
+                {
+                    "name": "configured",
+                    "base_url": "https://configured.example/v1",
+                    "api_key_env": "CONFIGURED_XAI_KEY",
+                }
+            ]
+        }
+        monkeypatch.setenv("CONFIGURED_XAI_KEY", "sk-configured")
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        with patch.object(xai_provider, "_load_xai_web_config", return_value=cfg):
+            assert web_tools._is_backend_available("xai") is True
 
     def test_is_backend_available_false_when_no_creds(self, monkeypatch, tmp_path):
         from tools import web_tools
@@ -719,6 +992,25 @@ class TestXAIBackendWiring:
         monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
         monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: False)
         assert web_tools._get_backend() != "xai"
+
+    def test_registry_xai_provider_available_via_configured_endpoint(self, monkeypatch):
+        from plugins.web.xai import provider as xai_provider
+
+        provider = xai_provider.XAIWebSearchProvider()
+        cfg = {
+            "endpoints": [
+                {
+                    "name": "configured",
+                    "base_url": "https://configured.example/v1",
+                    "api_key_env": "CONFIGURED_XAI_KEY",
+                }
+            ]
+        }
+        monkeypatch.setenv("CONFIGURED_XAI_KEY", "sk-configured")
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        monkeypatch.setattr(xai_provider, "has_xai_credentials", lambda: False)
+        with patch.object(xai_provider, "_load_xai_web_config", return_value=cfg):
+            assert provider.is_available() is True
 
 
 # ---------------------------------------------------------------------------
