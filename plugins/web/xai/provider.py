@@ -370,20 +370,14 @@ class XAIWebSearchProvider(WebSearchProvider):
         prompt = self._build_prompt(query, limit)
 
         configured_endpoints = _load_configured_endpoints(cfg)
+        endpoints: List[XAIWebEndpoint] = []
         if configured_endpoints:
             endpoints = _ordered_endpoints(configured_endpoints, cfg.get("strategy"))
         else:
             creds = resolve_xai_http_credentials()
             legacy_endpoint = _legacy_endpoint_from_credentials(creds, cfg)
-            if not legacy_endpoint:
-                return {
-                    "success": False,
-                    "error": (
-                        "No xAI credentials found. Run `hermes auth` to sign in with "
-                        "xAI Grok OAuth, or set XAI_API_KEY."
-                    ),
-                }
-            endpoints = [legacy_endpoint]
+            if legacy_endpoint:
+                endpoints = [legacy_endpoint]
 
         details: List[Dict[str, Any]] = []
         for endpoint in endpoints:

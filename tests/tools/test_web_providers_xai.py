@@ -917,6 +917,47 @@ class TestXAIProviderEndpointFailover:
 
 
 
+    def test_current_model_fallback_without_legacy_xai_credentials_uses_runtime_model(self):
+        from plugins.web.xai import provider as xai_provider
+
+        cfg = {
+            "strategy": "failover",
+            "fallback": {
+                "enabled": True,
+                "type": "current_model",
+                "require_native_web_search": True,
+                "timeout": 12,
+            },
+        }
+        runtime = {
+            "provider": "custom-openai-compatible",
+            "api_mode": "codex_responses",
+            "model": "grok-4.20-multi-agent-xhigh",
+            "base_url": "https://current-model.example/v1",
+            "api_key": "current-secret",
+        }
+        calls: list[dict] = []
+
+        def fake_post(url, **kwargs):
+            calls.append({"url": url, "json": kwargs.get("json", {}), "timeout": kwargs.get("timeout")})
+            return _mock_resp(_responses_payload(json.dumps({
+                "results": [{"title": "current", "url": "https://current.example", "description": "native"}]
+            })))
+
+        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds("")), \
+             patch.object(xai_provider, "_load_xai_web_config", return_value=cfg), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=runtime), \
+             patch("httpx.post", side_effect=fake_post):
+            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is True
+        assert [c["url"] for c in calls] == ["https://current-model.example/v1/responses"]
+        assert calls[0]["json"]["model"] == "grok-4.20-multi-agent-xhigh"
+        assert calls[0]["json"]["tools"] == [{"type": "web_search"}]
+        assert calls[0]["timeout"] == 12
+        assert result["data"]["web"][0]["url"] == "https://current.example"
+
+
 class TestXAIBackendWiring:
     def test_is_backend_available_true_via_env_var(self, monkeypatch):
         from tools import web_tools
